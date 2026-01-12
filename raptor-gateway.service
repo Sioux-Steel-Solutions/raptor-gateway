@@ -1,0 +1,21 @@
+[Unit]
+Description=Raptor Gateway - MQTT Bridge
+After=network.target mosquitto.service network-monitor.service
+Wants=network-monitor.service
+
+[Service]
+Type=simple
+User=pi
+Environment=NETWORK_STATUS_FILE=/var/run/network-status
+Environment=LOCAL_MQTT_URL=tcp://localhost:1883
+Environment=CLOUD_MQTT_URL=tcp://3.141.116.27:1883
+Environment=CLOUD_MQTT_USER=raptor
+Environment=CLOUD_MQTT_PASS=raptorMQTT2025
+Environment=RAPTOR_SITE=shop
+Environment=RAPTOR_DEVICE=revpi-135593
+ExecStart=/usr/local/bin/raptor-gateway
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
