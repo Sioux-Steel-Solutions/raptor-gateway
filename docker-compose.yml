@@ -5,12 +5,25 @@ services:
     restart: always
     network_mode: host
     volumes:
-      - /var/run/network-status:/var/run/network-status:ro
+      - raptor-network-spinner_status-data:/var/run/network-status-vol:ro
+      - gateway-data:/var/lib/raptor
     environment:
-      - NETWORK_STATUS_FILE=/var/run/network-status
+      - NETWORK_STATUS_FILE=/var/run/network-status-vol/network-status
       - LOCAL_MQTT_URL=tcp://localhost:1883
       - CLOUD_MQTT_URL=tcp://3.141.116.27:1883
       - CLOUD_MQTT_USER=raptor
       - CLOUD_MQTT_PASS=raptorMQTT2025
       - RAPTOR_SITE=shop
       - RAPTOR_DEVICE=revpi-135593
+      - SQLITE_PATH=/var/lib/raptor/gateway.db
+      - RETENTION_DAYS=30
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  raptor-network-spinner_status-data:
+    external: true
+  gateway-data:
