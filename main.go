@@ -35,6 +35,12 @@ type Config struct {
 	// Storage
 	SQLitePath    string
 	RetentionDays int
+
+	// Supabase sync
+	SupabaseURL     string
+	SupabaseKey     string
+	SyncBatchSize   int
+	SyncIntervalSec int
 }
 
 // Gateway bridges local MQTT to cloud MQTT based on network status
@@ -43,6 +49,7 @@ type Gateway struct {
 	localClient mqtt.Client
 	cloudClient mqtt.Client
 	store       *Store
+	supabase    *SupabaseSync
 
 	online   bool
 	onlineMu sync.RWMutex
@@ -89,6 +96,11 @@ func loadConfig() Config {
 
 		SQLitePath:    env("SQLITE_PATH", "/var/lib/raptor/gateway.db"),
 		RetentionDays: envInt("RETENTION_DAYS", 30),
+
+		SupabaseURL:     os.Getenv("SUPABASE_URL"),
+		SupabaseKey:     os.Getenv("SUPABASE_KEY"),
+		SyncBatchSize:   envInt("SYNC_BATCH_SIZE", 100),
+		SyncIntervalSec: envInt("SYNC_INTERVAL_SEC", 30),
 	}
 }
 
@@ -426,14 +438,14 @@ func (g *Gateway) initStore() error {
 	g.store = store
 
 	// Log startup
-	g.store.LogGatewayEvent("startup", fmt.Sprintf("version=1.1.0 site=%s device=%s", g.config.SiteID, g.config.DeviceID))
+	g.store.LogGatewayEvent("startup", fmt.Sprintf("version=1.2.0 site=%s device=%s", g.config.SiteID, g.config.DeviceID))
 
 	return nil
 }
 
 // Run starts the gateway
 func (g *Gateway) Run() error {
-	log.Println("Starting raptor-gateway v1.1.0...")
+	log.Println("Starting raptor-gateway v1.2.0...")
 	log.Printf("Local MQTT: %s", g.config.LocalMQTTURL)
 	log.Printf("Cloud MQTT: %s", g.config.CloudMQTTURL)
 	log.Printf("Network status file: %s", g.config.NetworkStatusFile)
@@ -444,6 +456,15 @@ func (g *Gateway) Run() error {
 		return fmt.Errorf("failed to init storage: %w", err)
 	}
 	defer g.store.Close()
+
+	// Initialize Supabase sync (if configured)
+	if g.config.SupabaseURL != "" && g.config.SupabaseKey != "" {
+		log.Printf("Supabase sync enabled: %s (batch=%d, interval=%ds)",
+			g.config.SupabaseURL, g.config.SyncBatchSize, g.config.SyncIntervalSec)
+		g.supabase = NewSupabaseSync(g.config.SupabaseURL, g.config.SupabaseKey, g.config.SyncBatchSize)
+	} else {
+		log.Println("Supabase sync disabled (SUPABASE_URL or SUPABASE_KEY not set)")
+	}
 
 	// Connect to local broker (always)
 	if err := g.connectLocalMQTT(); err != nil {
@@ -472,6 +493,7 @@ func (g *Gateway) Run() error {
 	go g.networkWatcher()
 	go g.statsLogger()
 	go g.pruneWorker()
+	go g.syncWorker()
 
 	log.Println("Gateway running. Press Ctrl+C to exit.")
 

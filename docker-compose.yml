@@ -17,6 +17,11 @@ services:
       - RAPTOR_DEVICE=revpi-135593
       - SQLITE_PATH=/var/lib/raptor/gateway.db
       - RETENTION_DAYS=30
+      # Supabase sync (set these to enable cloud analytics)
+      - SUPABASE_URL=${SUPABASE_URL:-}
+      - SUPABASE_KEY=${SUPABASE_KEY:-}
+      - SYNC_BATCH_SIZE=100
+      - SYNC_INTERVAL_SEC=30
     logging:
       driver: "json-file"
       options:
