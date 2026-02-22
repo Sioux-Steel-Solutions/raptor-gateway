@@ -155,7 +155,27 @@ func (g *Gateway) connectLocalMQTT() error {
 
 	opts.SetOnConnectHandler(func(c mqtt.Client) {
 		log.Println("Connected to local MQTT broker")
-		// Subscribe to all raptor topics
+		// Subscribe to all raptor topics on the local broker.
+		//
+		// ╔══════════════════════════════════════════════════════════════╗
+		// ║  CRITICAL: MQTT MESSAGE ROUTING RULES                       ║
+		// ║                                                              ║
+		// ║  Commands  →  cloud broker → gateway → local broker         ║
+		// ║  State     →  local broker → gateway → cloud broker         ║
+		// ║  Faults    →  local broker → gateway → cloud broker         ║
+		// ║                                                              ║
+		// ║  CMD MESSAGES MUST NEVER BE FORWARDED LOCAL→CLOUD.          ║
+		// ║  Doing so creates an infinite echo loop:                    ║
+		// ║    cloud cmd → handleCloudCommand → local publish           ║
+		// ║    local cmd → handleLocalMessage → cloud publish           ║
+		// ║    cloud cmd → handleCloudCommand → local publish → ∞       ║
+		// ║                                                              ║
+		// ║  This was discovered 2026-02-17 when a start/stop command   ║
+		// ║  produced 200+ msgs/sec on the cloud broker, causing the    ║
+		// ║  machine to rapidly toggle on/off and SQLite to deadlock.   ║
+		// ║  handleLocalMessage now drops all "cmd" topic messages      ║
+		// ║  before forwarding to cloud. Do not remove that guard.      ║
+		// ╚══════════════════════════════════════════════════════════════╝
 		topic := "raptor/#"
 		if token := c.Subscribe(topic, 1, g.handleLocalMessage); token.Wait() && token.Error() != nil {
 			log.Printf("Failed to subscribe to %s: %v", topic, token.Error())
@@ -184,6 +204,7 @@ func (g *Gateway) connectCloudMQTT() error {
 	opts := mqtt.NewClientOptions().
 		AddBroker(g.config.CloudMQTTURL).
 		SetClientID(fmt.Sprintf("raptor-gateway-%s-cloud", g.config.DeviceID)).
+		SetCleanSession(true). // Don't accumulate a message queue on broker when offline
 		SetAutoReconnect(true).
 		SetConnectRetry(true).
 		SetConnectRetryInterval(5 * time.Second).
@@ -216,6 +237,14 @@ func (g *Gateway) connectCloudMQTT() error {
 			log.Printf("Failed to subscribe to cloud commands: %v", token.Error())
 		} else {
 			log.Printf("Subscribed to cloud commands: %s", cmdTopic)
+		}
+
+		// Subscribe to sweep angle updates from cloud for forwarding to local HMI
+		sweepAngleTopic := "raptor/sweep/1/angle"
+		if token := c.Subscribe(sweepAngleTopic, 1, g.handleCloudSweepAngle); token.Wait() && token.Error() != nil {
+			log.Printf("Failed to subscribe to sweep angle: %v", token.Error())
+		} else {
+			log.Printf("Subscribed to sweep angle: %s", sweepAngleTopic)
 		}
 	})
 
@@ -272,6 +301,22 @@ func (g *Gateway) handleLocalMessage(client mqtt.Client, msg mqtt.Message) {
 		}
 	}
 
+	// ⚠️  DO NOT REMOVE THIS GUARD — it prevents an infinite command loop.
+	//
+	// Commands flow ONE direction: cloud → local.
+	// If we forward a local "cmd" message back to the cloud broker, the cloud
+	// subscription (handleCloudCommand) will receive it, forward it to local
+	// again, which triggers handleLocalMessage again, which forwards to cloud
+	// again — producing hundreds of messages per second and toggling the
+	// physical machine on/off uncontrollably.
+	//
+	// State and fault messages flow the other direction: local → cloud.
+	// That direction is safe because handleCloudCommand only subscribes to
+	// the /cmd topic, not /state or /faults.
+	if msgType == "cmd" {
+		return
+	}
+
 	// If online, forward to cloud
 	if g.IsOnline() && g.cloudClient != nil && g.cloudClient.IsConnected() {
 		token := g.cloudClient.Publish(topic, 1, false, payload)
@@ -308,6 +353,20 @@ func (g *Gateway) handleCloudCommand(client mqtt.Client, msg mqtt.Message) {
 		}
 	} else {
 		log.Printf("Warning: Cannot forward cloud command - local broker not connected")
+	}
+}
+
+// handleCloudSweepAngle forwards sweep angle updates from cloud to local broker for HMI
+func (g *Gateway) handleCloudSweepAngle(client mqtt.Client, msg mqtt.Message) {
+	topic := msg.Topic()
+	payload := msg.Payload()
+
+	// Forward to local broker for HMI consumption (no logging to reduce spam)
+	if g.localClient != nil && g.localClient.IsConnected() {
+		token := g.localClient.Publish(topic, 0, true, payload)
+		if token.Wait() && token.Error() != nil {
+			log.Printf("Failed to forward sweep angle to local: %v", token.Error())
+		}
 	}
 }
 
@@ -400,13 +459,29 @@ func (g *Gateway) pruneWorker() {
 	defer ticker.Stop()
 
 	prune := func() {
-		if g.store != nil {
-			log.Printf("Pruning records older than %d days...", g.config.RetentionDays)
-			if err := g.store.PruneOldRecords(g.config.RetentionDays); err != nil {
-				log.Printf("Failed to prune old records: %v", err)
-			} else {
-				log.Println("Prune complete")
+		if g.store == nil {
+			return
+		}
+
+		// Aggregate old synced records into Supabase telemetry_hourly before deleting from SQLite.
+		// This preserves historical data for long-range analytics even after raw records are pruned.
+		if g.supabase != nil && g.IsOnline() {
+			records, err := g.store.GetSyncedRecordsOlderThan(g.config.RetentionDays)
+			if err != nil {
+				log.Printf("Failed to get records for hourly aggregation: %v", err)
+			} else if len(records) > 0 {
+				log.Printf("Aggregating %d old records into telemetry_hourly before pruning...", len(records))
+				if err := g.supabase.AggregateAndUpsertHourly(records); err != nil {
+					log.Printf("Hourly aggregation error (will still prune): %v", err)
+				}
 			}
+		}
+
+		log.Printf("Pruning records older than %d days...", g.config.RetentionDays)
+		if err := g.store.PruneOldRecords(g.config.RetentionDays); err != nil {
+			log.Printf("Failed to prune old records: %v", err)
+		} else {
+			log.Println("Prune complete")
 		}
 	}
 
@@ -419,6 +494,48 @@ func (g *Gateway) pruneWorker() {
 			return
 		case <-ticker.C:
 			prune()
+		}
+	}
+}
+
+// rollupWorker periodically prunes Supabase telemetry records older than 48 hours.
+// Runs every hour after an initial 30-minute delay (to let the sync backlog clear first).
+func (g *Gateway) rollupWorker() {
+	if g.supabase == nil {
+		return
+	}
+
+	// Wait 6 hours before first prune:
+	// - Sync backlog (~617k records at 50/s) takes ~3.4 hours
+	// - Extra buffer to ensure all records are synced before pruning
+	select {
+	case <-g.stopCh:
+		return
+	case <-time.After(6 * time.Hour):
+	}
+
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	rollup := func() {
+		if !g.IsOnline() {
+			return
+		}
+		if err := g.supabase.PruneSupabase(g.config.SiteID, g.config.DeviceID, 48); err != nil {
+			log.Printf("Supabase prune error: %v", err)
+		} else {
+			log.Printf("Supabase prune complete: deleted telemetry older than 48h")
+		}
+	}
+
+	rollup()
+
+	for {
+		select {
+		case <-g.stopCh:
+			return
+		case <-ticker.C:
+			rollup()
 		}
 	}
 }
@@ -494,6 +611,7 @@ func (g *Gateway) Run() error {
 	go g.statsLogger()
 	go g.pruneWorker()
 	go g.syncWorker()
+	go g.rollupWorker()
 
 	log.Println("Gateway running. Press Ctrl+C to exit.")
 
