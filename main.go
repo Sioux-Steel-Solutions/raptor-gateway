@@ -278,7 +278,10 @@ func (g *Gateway) handleLocalMessage(client mqtt.Client, msg mqtt.Message) {
 		msgType = parts[3]
 	}
 
-	log.Printf("Local msg [%s]: %s (%d bytes)", msgType, topic, len(payload))
+	// Skip logging high-frequency angle messages to reduce spam
+	if msgType != "angle" {
+		log.Printf("Local msg [%s]: %s (%d bytes)", msgType, topic, len(payload))
+	}
 
 	// Store locally based on message type
 	if g.store != nil {
@@ -292,6 +295,10 @@ func (g *Gateway) handleLocalMessage(client mqtt.Client, msg mqtt.Message) {
 			// Parse fault payload and store
 			// For now, just log it
 			log.Printf("Fault message received: %s", string(payload))
+		case "angle":
+			// Skip storing high-frequency angle telemetry
+			// These are forwarded by handleCloudSweepAngle and don't need persistence
+			return
 		default:
 			// Store as state for unknown types
 			storeErr = g.store.StoreState(payload)
